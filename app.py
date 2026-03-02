@@ -3,10 +3,11 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.interpolate import interp2d
+from scipy.optimize import minimize_scalar
 
 st.set_page_config(page_title="EV Simulator with Accuracy Validation", layout="wide")
 
-def run_simulation(m, Capacity_kWh, slope_deg, initial_SOC, cycleType, csv_data=None, enable_eff_map=False, enable_thermal=False):
+def run_simulation(m, Capacity_kWh, slope_deg, initial_SOC, cycleType, csv_data=None, enable_eff_map=False, enable_thermal=False, p_aux=0):
     # Base Constants (Do NOT modify these)
     Cd = 0.29
     A = 2.2
@@ -129,9 +130,9 @@ def run_simulation(m, Capacity_kWh, slope_deg, initial_SOC, cycleType, csv_data=
             eta_dynamic = eta_base
             
         if P_mech < 0:
-            P_elec = P_mech * regen_eff
+            P_elec = (P_mech * regen_eff) + p_aux
         else:
-            P_elec = P_mech / eta_dynamic
+            P_elec = (P_mech / eta_dynamic) + p_aux
             
         # 4. Thermal Logic applied to R_internal (Modular Add)
         if enable_thermal:
@@ -195,8 +196,92 @@ def run_simulation(m, Capacity_kWh, slope_deg, initial_SOC, cycleType, csv_data=
         'energy_balance_error': energy_balance_error,
         'avg_eff': avg_eff,
         'range_est': range_est,
-        'Wh_per_km': Wh_per_km
+        'Wh_per_km': Wh_per_km,
+        'm': m,
+        'initial_SOC': initial_SOC,
+        'slope_deg': slope_deg,
+        'enable_eff_map': enable_eff_map
     }
+
+def eco_speed_advisory(m, slope_deg, initial_soc, current_wh_km, p_aux=1000, enable_eff_map=False, avg_v_ms=None):
+    # Constants from run_simulation
+    Cd, A, rho, Cr, g, eta_base = 0.29, 2.2, 1.2, 0.015, 9.81, 0.92
+    r_wheel, gear_ratio = 0.3, 10.0
+    regen_eff = 0.65
+    
+    theta = slope_deg * np.pi / 180
+    
+    # Efficiency map configuration (static for sweep)
+    eff_map_func = None
+    use_rgi = False
+    if enable_eff_map:
+        w_points = np.linspace(0, 1500, 10)
+        T_points = np.linspace(0, 500, 10)
+        eff_grid = 0.85 + 0.10 * np.sin(w_points / 1500 * np.pi)[:, None] * np.sin(T_points / 500 * np.pi)
+        eff_grid = np.clip(eff_grid, 0.70, 0.96)
+        try:
+            from scipy.interpolate import RegularGridInterpolator
+            eff_map_func = RegularGridInterpolator((w_points, T_points), eff_grid, bounds_error=False, fill_value=0.85)
+            use_rgi = True
+        except:
+            eff_map_func = interp2d(T_points, w_points, eff_grid, kind='linear')
+            use_rgi = False
+
+    def calculate_wh_km(v):
+        if v <= 0: return 1000 # Penalty for stalling
+        # Physics Equations with Mass Sensitivity Refinements
+        cr_eff = Cr * (1 + 0.00005 * (m - 1500))
+        f_drag = 0.5 * rho * A * Cd * v**2
+        f_roll = m * g * cr_eff * np.cos(theta)
+        f_slope = m * g * np.sin(theta)
+        f_total = f_drag + f_roll + f_slope
+        
+        p_mech = f_total * v
+        
+        if enable_eff_map and p_mech > 0:
+            w_rad_s = min(v * gear_ratio / r_wheel, 1499)
+            T_nm = min(abs(f_total * r_wheel / gear_ratio), 499)
+            if use_rgi:
+                eta = float(eff_map_func([[w_rad_s, T_nm]])[0])
+            else:
+                eta = float(eff_map_func(T_nm, w_rad_s)[0])
+        else:
+            eta = eta_base if p_mech > 0 else regen_eff
+            
+        if p_mech > 0:
+            p_elec_drive = p_mech / eta
+        else:
+            p_elec_drive = p_mech * eta
+            
+        # Add inertial loss component (Acceleration Energy distributed per km)
+        # E_acc = 0.5 * m * v^2 (Joules). Distribution force = E_acc / 1000.
+        f_inertial = (0.5 * m * v**2) / 1000
+        p_inertial = f_inertial * v
+        
+        # Add auxiliary load and inertial penalty
+        p_total = p_elec_drive + p_aux + p_inertial
+        
+        # Wh/km = (P_total / v) / 3.6
+        wh_km = (p_total / v) / 3.6
+        return wh_km
+
+    # Sweep for plotting
+    v_sweep_ms = np.linspace(5, 35, 100)
+    v_sweep_kmh = v_sweep_ms * 3.6
+    wh_km_arr = np.array([calculate_wh_km(v) for v in v_sweep_ms])
+    
+    # Precise optimization
+    res_opt = minimize_scalar(calculate_wh_km, bounds=(5, 35), method='bounded')
+    opt_v_ms = res_opt.x
+    opt_v_kmh = opt_v_ms * 3.6
+    opt_wh_km = calculate_wh_km(opt_v_ms)
+    
+    # Calculate modeled consumption at simulation's average speed for comparison
+    modeled_wh_at_avg = 0.0
+    if avg_v_ms is not None:
+        modeled_wh_at_avg = calculate_wh_km(avg_v_ms)
+    
+    return v_sweep_kmh, wh_km_arr, opt_v_kmh, opt_wh_km, modeled_wh_at_avg
 
 # UI Layout
 st.title("EV Simulator with Accuracy Validation & Advanced Features")
@@ -216,6 +301,7 @@ if cycleDrop == "CSV Upload":
 st.sidebar.header("Advanced Features")
 eff_map_toggle = st.sidebar.checkbox("Enable Motor Efficiency Map", value=False)
 thermal_toggle = st.sidebar.checkbox("Enable Battery Thermal Model", value=False)
+aux_load_input = st.sidebar.slider("Auxiliary Load (W)", 0, 2000, 1000)
 
 runBtn = st.sidebar.button("Run Simulation", type="primary", use_container_width=True)
 
@@ -244,7 +330,8 @@ if runBtn:
         cycleType=cycleDrop,
         csv_data=csv_df,
         enable_eff_map=eff_map_toggle,
-        enable_thermal=thermal_toggle
+        enable_thermal=thermal_toggle,
+        p_aux=aux_load_input
     )
     
     # Custom CSS to style metrics
@@ -271,6 +358,65 @@ if runBtn:
     col4.metric("Estimated Range", f"{res['range_est']:.1f} km")
     col5.metric("Consumption", f"{res['Wh_per_km']:.1f} Wh/km")
     
+    st.markdown("---")
+    
+    # Adaptive Eco-Speed Advisory Section
+    st.subheader("Adaptive Eco-Speed Advisory (Physics-Based)")
+    avg_v_ms = np.mean(res['v'])
+    v_kmh_sweep, wh_km_sweep, opt_v_kmh, opt_wh_km, modeled_wh_at_avg = eco_speed_advisory(
+        m=res['m'],
+        slope_deg=res['slope_deg'],
+        initial_soc=res['initial_SOC'],
+        current_wh_km=res['Wh_per_km'],
+        p_aux=aux_load_input,
+        enable_eff_map=res['enable_eff_map'],
+        avg_v_ms=avg_v_ms
+    )
+    
+    col_adv1, col_adv2 = st.columns([2, 1])
+    
+    with col_adv1:
+        plt.style.use('dark_background')
+        fig_eco, ax_eco = plt.subplots(figsize=(10, 5))
+        ax_eco.plot(v_kmh_sweep, wh_km_sweep, color='#00ffcc', linewidth=2.5, label='Efficiency Curve')
+        ax_eco.scatter(opt_v_kmh, opt_wh_km, color='red', s=100, zorder=5, label=f'Optimal: {opt_v_kmh:.0f} km/h')
+        
+        # Current avg speed marker
+        avg_v_ms = np.mean(res['v'])
+        avg_v_kmh = avg_v_ms * 3.6
+        if avg_v_kmh > 1:
+            ax_eco.axvline(avg_v_kmh, color='yellow', linestyle=':', alpha=0.7, label=f'Current Avg: {avg_v_kmh:.0f} km/h')
+            
+        ax_eco.set_title("Steady-State Consumption vs. Speed", fontsize=12, loc='left')
+        ax_eco.set_xlabel("Speed (km/h)")
+        ax_eco.set_ylabel("Consumption (Wh/km)")
+        ax_eco.grid(True, alpha=0.2)
+        ax_eco.legend()
+        ax_eco.spines['top'].set_visible(False)
+        ax_eco.spines['right'].set_visible(False)
+        st.pyplot(fig_eco)
+        
+    with col_adv2:
+        current_wh = res['Wh_per_km']
+        
+        if modeled_wh_at_avg > 0:
+            savings = max(0, (modeled_wh_at_avg - opt_wh_km) / modeled_wh_at_avg * 100)
+            st.info(f"For current road slope and vehicle mass ({res['m']} kg), the recommended eco speed is **{opt_v_kmh:.0f} km/h**. Driving at this speed can improve efficiency by approximately **{savings:.1f}%**.")
+        else:
+            st.info(f"Recommended eco speed: **{opt_v_kmh:.0f} km/h**.")
+            
+        st.write(f"**Auxiliary load considered:** {aux_load_input} W")
+        st.write(f"**Mass-sensitive refined range:** {(batteryField * res['initial_SOC'] * 1000 / modeled_wh_at_avg):.1f} km")
+            
+        # Additional context-aware advice
+        if res['SOC_vec'][-1] < 30:
+            st.warning("⚠️ Battery is low. Conservative driving recommended.")
+        
+        if res['slope_deg'] > 5:
+            st.warning("⚠️ High uphill detected. Lower speed improves range.")
+        elif res['slope_deg'] < -5:
+            st.success("✅ Downhill detected. Use regenerative braking effectively.")
+
     st.markdown("---")
     
     # Use standard matplotlib styles suitable for dark/light mode
